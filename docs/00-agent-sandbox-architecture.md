@@ -27,7 +27,7 @@ graph TB
     Container -. "outbound network via mounted<br/>unix socket only" .-> Proxy
 ```
 
-**Sandbox API Service** - stateless service exposing the REST API below. Concurrency for a given sandbox (exec vs. exec, exec vs. delete, exec vs. files) is enforced via database-backed distributed lock plus container naming strategy, see [Exec concurrency](#exec-concurrency).
+**Sandbox API Service** - stateless service exposing the REST API below. Concurrency for a given sandbox (exec vs. exec, exec vs. delete, exec vs. files) is enforced via database-backed distributed lock plus container naming strategy, see [Concurrency](#concurrency).
 
 **Metadata DB** - stores sandbox configuration (see [Data Model](#6-data-model)).
 
@@ -63,7 +63,7 @@ All capabilities are dropped, the root filesystem is read-only, resource limits 
 ## 3. Sandbox Operations
 
 - **Create** allocates metadata and NFS storage only - nothing is provisioned in Docker.
-- **Exec** creates a volume and a container, both named after the sandbox id, runs the command, and disposes of both when it finishes (see [Exec concurrency](#exec-concurrency)).
+- **Exec** creates a volume and a container, both named after the sandbox id, runs the command, and disposes of both when it finishes (see [Concurrency](#concurrency)).
 - **Delete** removes sandbox metadata and its NFS storage. It's rejected with `409 SANDBOX_EXECUTING` while an exec is running for the sandbox.
 - **Files** (`GET`/`POST /files`) read/write NFS storage directly and are rejected with `409 SANDBOX_EXECUTING` while an exec is running for the sandbox, to avoid racing a container that's actively writing.
 
@@ -367,7 +367,7 @@ create table sandbox
 );
 ```
 
-`workspace` is the directory inside the container to persist. Its NFS-side location is not stored - it's derived deterministically from the sandbox id (e.g. `{nfs_root}/{id}`), and the per-exec container and volume are likewise both just named after the sandbox id (see [Exec concurrency](#exec-concurrency)).
+`workspace` is the directory inside the container to persist. Its NFS-side location is not stored - it's derived deterministically from the sandbox id (e.g. `{nfs_root}/{id}`), and the per-exec container and volume are likewise both just named after the sandbox id (see [Concurrency](#concurrency)).
 
 ## 7. Out of scope/Future work
 
