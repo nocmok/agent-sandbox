@@ -134,6 +134,19 @@ paths:
           $ref: '#/components/responses/BadRequest'
     get:
       summary: List sandboxes
+      parameters:
+        - name: page
+          in: query
+          required: true
+          example: 0
+          schema:
+            type: integer
+        - name: size
+          in: query
+          required: true
+          example: 10
+          schema:
+            type: integer
       responses:
         '200':
           description: List of sandboxes
@@ -161,10 +174,7 @@ paths:
     delete:
       summary: Deletes a sandbox.
       description: >
-        Deletes sandbox metadata and its NFS storage. Rejected while an
-        exec is in progress for the sandbox; otherwise, as a safety net,
-        also makes a best-effort attempt to remove any container/volume
-        left over under the sandbox id (e.g. from a crashed exec).
+        Deletes sandbox metadata and its NFS storage.
       responses:
         '204':
           description: Sandbox deleted.
@@ -212,9 +222,9 @@ paths:
         required: true
         schema:
           type: string
-        description: File path relative to the sandbox volume root.
+        description: File path relative to the sandbox workspace.
     get:
-      summary: Download a file from the sandbox volume
+      summary: Download a file from the sandbox workspace
       responses:
         '200':
           description: File contents
@@ -238,7 +248,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
     post:
-      summary: Upload a file to the sandbox volume
+      summary: Upload a file to the sandbox workspace
       description: Overwrites the file if it already exists.
       requestBody:
         required: true
@@ -294,11 +304,8 @@ components:
           format: uuid
         image:
           type: string
-        volume:
-          type: object
-          properties:
-            path:
-              type: string
+        workspace:
+          type: string
         created_at:
           type: string
           format: date-time
@@ -363,7 +370,8 @@ create table sandbox
     workspace    text not null,
     locked_until timestamptz,
     created_at   timestamptz not null default now(),
-    deleted_at   timestamptz
+    deleted_at   timestamptz,
+    idempotency_key uuid not null
 );
 ```
 
