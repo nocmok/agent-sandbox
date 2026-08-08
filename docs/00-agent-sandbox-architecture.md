@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-Simple POC tool to manage isolated, ephemeral execution environments for running agentic code. Each sandbox pairs container with a persistent, NFS-backed workspace volume. For simplicity each sandbox specifies concrete directory to be persisted, file system out of specified directory is ephemeral. Sandbox metadata is stored in postgres, so a sandbox can be stopped and restarted without losing its filesystem state (within specified directory), and its data is only deleted when the sandbox itself is deleted.
+Simple POC tool to manage isolated, ephemeral execution environments for running agentic code. Each sandbox pairs container with a persistent, NFS-backed workspace volume. For simplicity each sandbox specifies concrete directory to be persisted (workspace), file system out of specified directory is ephemeral. Sandbox metadata is stored in postgres, so a sandbox's filesystem state (within workspace) persists across execs and is only deleted when the sandbox itself is deleted.
 
 Authentication and authorization are **out of scope** for this document. Requests are assumed to already be authenticated (e.g. by an upstream gateway) by the time they reach this service.
 
@@ -18,29 +18,31 @@ graph TB
     NFS[(NFS Storage)]
     Proxy[[Egress Proxy]]
 
-    Client -- "HTTP: create / list / start / stop /<br/>delete / exec / files" --> API
+    Client -- "HTTP: create / list /<br/>delete / exec / files" --> API
     API -- "read & write sandbox metadata" --> DB
-    API -- "create / start / stop" --> Docker
+    API -- "exec / delete" --> Docker
     Docker -- "runs" --> Container
     Docker -- "mounts volume backed by" --> NFS
     API -- "upload / download files directly" --> NFS
     Container -. "outbound network via mounted<br/>unix socket only" .-> Proxy
 ```
 
-**Sandbox API Service** - stateless service exposing the REST API below. Serializes state-changing operations per sandbox (create/start/stop/delete) behind a per-sandbox lock, so concurrent requests against the same sandbox don't race.
+**Sandbox API Service** - stateless service exposing the REST API below. Concurrency for a given sandbox (exec vs. exec, exec vs. delete, exec vs. files) is enforced via database-backed distributed lock plus container naming strategy, see [Exec concurrency](#exec-concurrency).
 
-**Metadata DB** - stores sandbox configuration and the history of container starts/stops (see [Data Model](#6-data-model)).
+**Metadata DB** - stores sandbox configuration (see [Data Model](#6-data-model)).
 
-**Docker Engine** - creates and runs the container for a sandbox, and creates the volume backing its workspace. The container's entrypoint is overridden to `/bin/sh` so it stays alive independent of the image's default command; `exec` is then used to run commands inside it.
+**Docker Engine** - creates the nfs-backed volume and container for a sandbox on each exec call, and disposes of both once the command finishes.
 
-**NFS Storage** - durable storage for sandbox workspaces. Persists independently of the container lifecycle. The API service can also read and write files here directly (`GET`/`POST /files`), without going through the container. To prevent data violation files manipulations only allowed while sandbox is stopped. 
+**NFS Storage** - durable storage for sandbox workspaces. Persists independently of the container/volume lifecycle. The API service can also read and write files here directly (`GET`/`POST /files`), without going through the container. To prevent data corruption, file manipulations are rejected while an exec is in flight for the sandbox.
 
 ### Container security profile
 
-Containers are launched hardened per Anthropic's [secure deployment guidance](https://code.claude.com/docs/en/agent-sdk/secure-deployment#containers):
+Containers are launched fresh for each exec call and hardened per Anthropic's [secure deployment guidance](https://code.claude.com/docs/en/agent-sdk/secure-deployment#containers):
 
 ```sh
 docker run \
+  --rm \
+  --name $SANDBOX_ID \
   --cap-drop ALL \
   --security-opt no-new-privileges \
   --security-opt seccomp=/path/to/seccomp-profile.json \
@@ -51,41 +53,40 @@ docker run \
   --cpus 2 \
   --pids-limit 100 \
   --user 1000:1000 \
-  -v /path/to/code:/workspace:ro \
+  -v $SANDBOX_ID:/workspace:ro \
   -v /var/run/proxy.sock:/var/run/proxy.sock:ro \
   agent-image
 ```
 
-All capabilities are dropped, the root filesystem is read-only, resource limits are enforced, and the process runs as an unprivileged, non-root user.
+All capabilities are dropped, the root filesystem is read-only, resource limits are enforced, and the process runs as an unprivileged, non-root user. `--name` is the sandbox id and `--rm` removes the container automatically once the command exits.
 
-## 3. Sandbox Lifecycle
+## 3. Sandbox Operations
 
-A sandbox has two externally visible states, `started` and `stopped`. A newly created sandbox starts in `stopped` (no container exists yet); it behaves identically to a sandbox that was previously started and then stopped.
+- **Create** allocates metadata and NFS storage only - nothing is provisioned in Docker.
+- **Exec** creates a volume and a container, both named after the sandbox id, runs the command, and disposes of both when it finishes (see [Exec concurrency](#exec-concurrency)).
+- **Delete** removes sandbox metadata and its NFS storage. It's rejected with `409 SANDBOX_EXECUTING` while an exec is running for the sandbox.
+- **Files** (`GET`/`POST /files`) read/write NFS storage directly and are rejected with `409 SANDBOX_EXECUTING` while an exec is running for the sandbox, to avoid racing a container that's actively writing.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Stopped : POST /sandboxes
-    Stopped --> Started : POST /start
-    Started --> Stopped : POST /stop
-    Stopped --> [*] : DELETE
+### Concurrency
 
-    note right of Started
-        POST /start  → no-op (200)
-        DELETE       → 409 Conflict
-        POST /exec   → runs command
-    end note
+For following operations distributed lock is acquired by sandbox id 
+  - `POST /exec`
+  - `POST /delete`
+  - `POST /file`
 
-    note right of Stopped
-        POST /stop   → no-op (200)
-        POST /exec   → 409 Conflict
-    end note
-```
+Also each resource allocated in docker derives its name from sandbox id in deterministic way, which makes impossible for example to run multiple parallel containers for single sandbox (docker will reject it by name conflict).
 
-- **Create** allocates metadata and NFS storage only - no container is started.
-- **Start** is idempotent: starting an already-started sandbox is a no-op. Otherwise it creates the volume, creates the container bound to that volume, and starts it.
-- **Stop** is idempotent: stopping an already-stopped sandbox is a no-op. Otherwise it removes the container and volume; metadata and NFS storage are preserved.
-- **Delete** removes sandbox metadata and its NFS storage. It's only allowed while the sandbox is `stopped`.
-- **Exec** requires the sandbox to be `started`.
+Also each listed operation performs explicit sandbox execution state check before running:
+1. Check if container exists by sandbox id. If it doesn't exist sandbox is not executing.
+2. Check container state. Running container means sandbox is executing. When sandbox executing all operations are prohibited. 
+3. If container is not running sandbox is not executing. Dead container and affiliated volume should be deleted.
+
+Lock algorithm is following
+1. Get row level lock by sandbox id.
+2. Check if sandbox.locked_until is null or < now(). If so lock can be aqcuired.
+3. Acquire lock by setting sandbox.locked_until = now() + 1 minute.
+4. Perform operation. During operation execution locked_until should be updated periodically (for example every 5 second) by separate task.  
+5. Release lock by setting sandbox.locked_until = null.
 
 ## 4. API Reference
 
@@ -133,16 +134,6 @@ paths:
           $ref: '#/components/responses/BadRequest'
     get:
       summary: List sandboxes
-      parameters:
-        - name: state
-          in: query
-          required: false
-          schema:
-            type: string
-            enum: 
-              - started
-              - stopped
-          description: Filter sandboxes by current state.
       responses:
         '200':
           description: List of sandboxes
@@ -169,50 +160,22 @@ paths:
           $ref: '#/components/responses/NotFound'
     delete:
       summary: Deletes a sandbox.
-      description: Deletes sandbox metadata and its NFS storage. The sandbox must be stopped.
+      description: >
+        Deletes sandbox metadata and its NFS storage. Rejected while an
+        exec is in progress for the sandbox; otherwise, as a safety net,
+        also makes a best-effort attempt to remove any container/volume
+        left over under the sandbox id (e.g. from a crashed exec).
       responses:
         '204':
           description: Sandbox deleted.
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: Sandbox started.
+          description: An exec is in progress for this sandbox (SANDBOX_EXECUTING).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-
-  /sandboxes/{id}/start:
-    post:
-      summary: Starts a sandbox.
-      description: >
-        Creates and starts the sandbox's container and volume.
-        No-op if the sandbox is already started.
-      parameters:
-        - $ref: '#/components/parameters/SandboxId'
-      responses:
-        '200':
-          description: Sandbox started (or already running).
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/ConcurrentModification'
-
-  /sandboxes/{id}/stop:
-    post:
-      summary: Stops a sandbox.
-      description: >
-        Removes the sandbox's container and volume. Metadata and NFS
-        storage are preserved. No-op if the sandbox is already stopped.
-      parameters:
-        - $ref: '#/components/parameters/SandboxId'
-      responses:
-        '200':
-          description: Sandbox stopped (or already stopped)
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/ConcurrentModification'
 
   /sandboxes/{id}/exec:
     post:
@@ -235,7 +198,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: Sandbox is not started
+          description: Another exec is already running for this sandbox (SANDBOX_EXECUTING).
           content:
             application/json:
               schema:
@@ -268,6 +231,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: An exec is in progress for this sandbox (SANDBOX_EXECUTING).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     post:
       summary: Upload a file to the sandbox volume
       description: Overwrites the file if it already exists.
@@ -286,6 +255,12 @@ paths:
           description: File uploaded
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: An exec is in progress for this sandbox (SANDBOX_EXECUTING).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
 components:
   parameters:
@@ -302,19 +277,14 @@ components:
       type: object
       required: 
         - image
-        - volume
+        - workspace
       properties:
         image:
           type: string
           example: my-agentic-app-image
-        volume:
-          type: object
-          required: 
-           - path
-          properties:
-            path:
-              type: string
-              example: /workspace
+        workspace:
+          type: string
+          example: /workspace
 
     Sandbox:
       type: object
@@ -329,11 +299,6 @@ components:
           properties:
             path:
               type: string
-        state:
-          type: string
-          enum: 
-            - started
-            - stopped
         created_at:
           type: string
           format: date-time
@@ -377,22 +342,14 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
-    ConcurrentModification:
-      description: "Concurrent modification to same resource"
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Error'
 ```
 
-| HTTP Status | Code                      | Description                                                                 |
-| ----------- | ------------------------- | --------------------------------------------------------------------------- |
-| 400         | `VALIDATION_ERROR`        | Request body or query parameter is missing/malformed                        |
-| 404         | `SANDBOX_NOT_FOUND`       | No sandbox exists with the given id                                         |
-| 409         | `SANDBOX_RUNNING`         | Delete requested while the sandbox is started                               |
-| 409         | `SANDBOX_NOT_STARTED`     | Exec requested while the sandbox is stopped                                 |
-| 409         | `CONCURRENT_MODIFICATION` | Another start/stop/delete operation is already in progress for this sandbox |
-| 500         | `INTERNAL_ERROR`          | Unexpected server-side failure                                              |
+| HTTP Status | Code                                  | Description                                                                                 |
+| ----------- | ------------------------------------- | ------------------------------------------------------------------------------------------- |
+| 400         | `VALIDATION_ERROR`                    | Request body or query parameter is missing/malformed                                        |
+| 404         | `SANDBOX_NOT_FOUND`                   | No sandbox exists with the given id                                                         |
+| 409         | `SANDBOX_LOCKED`, `SANDBOX_EXECUTING` | Exec, delete, or file operation requested while an exec is already running for this sandbox |
+| 500         | `INTERNAL_ERROR`                      | Unexpected server-side failure                                                              |
 
 ## 6. Data Model
 
@@ -402,31 +359,21 @@ components:
 create table sandbox
 (
     id         uuid primary key default gen_random_uuid(),
-    config     jsonb not null,        -- creation input: image, volume path, etc.
-    data       jsonb not null,        -- NFS reference, released on deletion
+    image      text not null,
+    workspace  text not null,
+    locked_at  timestamptz,
     created_at timestamptz not null default now(),
     deleted_at timestamptz
 );
 ```
 
-**`sandbox_start`** - one row per start.
-
-```sql
-create table sandbox_start
-(
-    id         uuid primary key default gen_random_uuid(),
-    sandbox_id uuid not null references sandbox(id),
-    data       jsonb not null,        -- container and volume id, released on stop
-    started_at timestamptz not null default now(),
-    stopped_at timestamptz
-);
-```
+`workspace` is the directory inside the container to persist. Its NFS-side location is not stored - it's derived deterministically from the sandbox id (e.g. `{nfs_root}/{id}`), and the per-exec container and volume are likewise both just named after the sandbox id (see [Exec concurrency](#exec-concurrency)).
 
 ## 7. Out of scope/Future work
 
-- Authentication
 - Container -> MicroVM replacement
 - Full FS persistence
-- FS compression
+- Move sandbox to archived state
 - Distributed NFS
 - Distributed control plane
+- Authentication
