@@ -29,16 +29,16 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	pool, err := db.NewPool(ctx, cfg.DatabaseURL)
+	pool, err := db.NewPool(ctx, cfg.DBURL)
 	if err != nil {
 		log.Fatalf("connecting to database: %v", err)
 	}
 	defer pool.Close()
 
 	repo := sandbox.NewPostgresRepository(pool)
-	fs := storage.New(cfg.NFSExportHost)
+	fs := storage.New(cfg.NFSHost)
 
-	docker, err := dockerengine.New(cfg.NFSExportHost)
+	docker, err := dockerengine.New(cfg.NFSHost)
 	if err != nil {
 		log.Fatalf("connecting to docker engine: %v", err)
 	}

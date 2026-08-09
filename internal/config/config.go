@@ -1,4 +1,3 @@
-// Package config loads sandboxd's configuration from the environment.
 package config
 
 import (
@@ -7,19 +6,22 @@ import (
 )
 
 type Config struct {
-	ListenAddr    string
-	DatabaseURL   string
-	NFSExportHost string // NFS server hostname, e.g. nfs-server - sandboxd dials it directly (see internal/storage), no local mount needed
+	ListenAddr string
+	DBURL      string
+	NFSHost    string
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		ListenAddr:    getEnv("LISTEN_ADDR", ":8080"),
-		DatabaseURL:   os.Getenv("DATABASE_URL"),
-		NFSExportHost: getEnv("NFS_EXPORT_HOST", "localhost"),
+		ListenAddr: getEnv("LISTEN_ADDR", ":8080"),
+		DBURL:      os.Getenv("DB_URL"),
+		NFSHost:    os.Getenv("NFS_HOST"),
 	}
-	if cfg.DatabaseURL == "" {
-		return Config{}, fmt.Errorf("DATABASE_URL is required")
+	if cfg.DBURL == "" {
+		return Config{}, fmt.Errorf("DB_URL is required")
+	}
+	if cfg.NFSHost == "" {
+		return Config{}, fmt.Errorf("NFS_HOST is required")
 	}
 	return cfg, nil
 }
