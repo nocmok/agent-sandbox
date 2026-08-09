@@ -122,6 +122,9 @@ func (r *fakeRepo) ReleaseLock(ctx context.Context, id uuid.UUID) error {
 
 type fakeDockerClient struct{}
 
+func (fakeDockerClient) ImageExists(ctx context.Context, image string) (bool, error) {
+	return true, nil
+}
 func (fakeDockerClient) PullImage(ctx context.Context, image string) error         { return nil }
 func (fakeDockerClient) CreateVolume(ctx context.Context, name, path string) error { return nil }
 func (fakeDockerClient) RemoveVolume(ctx context.Context, name string) error       { return nil }

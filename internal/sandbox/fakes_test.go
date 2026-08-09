@@ -128,7 +128,10 @@ type fakeDocker struct {
 	mu    sync.Mutex
 	calls []string
 
-	pullErr         error
+	imageExists    bool
+	imageExistsErr error
+	pullErr        error
+
 	createVolumeErr error
 	removeVolumeErr error
 	runErr          error
@@ -174,6 +177,11 @@ func (d *fakeDocker) callCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return len(d.calls)
+}
+
+func (d *fakeDocker) ImageExists(ctx context.Context, image string) (bool, error) {
+	d.record("ImageExists")
+	return d.imageExists, d.imageExistsErr
 }
 
 func (d *fakeDocker) PullImage(ctx context.Context, image string) error {

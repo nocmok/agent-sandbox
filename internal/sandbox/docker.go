@@ -30,6 +30,11 @@ const (
 // Engine API. Declared here (the consumer package) so unit tests can supply
 // hand-written fakes.
 type DockerClient interface {
+	// ImageExists reports whether image is already present in the local
+	// Docker image store, so callers can skip PullImage (which - even when
+	// the image is fully cached - still makes a round trip to the registry
+	// to resolve the tag, on the order of seconds) in the common case.
+	ImageExists(ctx context.Context, image string) (bool, error)
 	PullImage(ctx context.Context, image string) error
 
 	// CreateVolume creates a Docker volume named name, NFS-backed at

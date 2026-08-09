@@ -8,6 +8,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
+	"time"
 
 	"github.com/containerd/errdefs"
 	dockerclient "github.com/docker/docker/client"
@@ -43,6 +45,17 @@ func New(nfsExportHost string) (*Client, error) {
 		return nil, err
 	}
 	return &Client{cli: cli, nfsExportHost: nfsExportHost}, nil
+}
+
+func (c *Client) ImageExists(ctx context.Context, img string) (bool, error) {
+	_, err := c.cli.ImageInspect(ctx, img)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (c *Client) PullImage(ctx context.Context, img string) error {
@@ -130,12 +143,15 @@ func (c *Client) RunContainer(ctx context.Context, spec sandbox.ContainerSpec, c
 		}},
 	}
 
+	t0 := time.Now()
 	resp, err := c.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, spec.Name)
 	if err != nil {
 		return 0, err
 	}
+	log.Printf("[profile] %s ContainerCreate took %s", spec.Name, time.Since(t0))
 	containerID := resp.ID
 
+	t1 := time.Now()
 	attached, err := c.cli.ContainerAttach(ctx, containerID, container.AttachOptions{
 		Stream: true,
 		Stdout: true,
@@ -145,10 +161,13 @@ func (c *Client) RunContainer(ctx context.Context, spec sandbox.ContainerSpec, c
 		return 0, err
 	}
 	defer attached.Close()
+	log.Printf("[profile] %s ContainerAttach took %s", spec.Name, time.Since(t1))
 
+	t2 := time.Now()
 	if err := c.cli.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
 		return 0, err
 	}
+	log.Printf("[profile] %s ContainerStart took %s (time to first byte from here)", spec.Name, time.Since(t2))
 
 	copyDone := make(chan error, 1)
 	go func() {
@@ -160,6 +179,7 @@ func (c *Client) RunContainer(ctx context.Context, spec sandbox.ContainerSpec, c
 	// AutoRemove set, and removal (which detaches its volume) happens
 	// asynchronously after it exits. Waiting only for "not running" races
 	// the subsequent RemoveVolume call against that in-progress teardown.
+	t3 := time.Now()
 	statusCh, errCh := c.cli.ContainerWait(ctx, containerID, container.WaitConditionRemoved)
 	var exitCode int
 	select {
@@ -168,6 +188,7 @@ func (c *Client) RunContainer(ctx context.Context, spec sandbox.ContainerSpec, c
 	case status := <-statusCh:
 		exitCode = int(status.StatusCode)
 	}
+	log.Printf("[profile] %s ContainerWait(Removed) took %s (includes command run time)", spec.Name, time.Since(t3))
 
 	if err := <-copyDone; err != nil {
 		return exitCode, err

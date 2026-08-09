@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"sync"
 	"testing"
 
@@ -144,7 +145,7 @@ func TestExec_HappyPathCallsDockerInOrderAndCleansUp(t *testing.T) {
 		t.Fatalf("expected captured output, got %q", buf.String())
 	}
 
-	want := []string{"ContainerStatus", "PullImage", "CreateVolume", "RunContainer", "RemoveVolume"}
+	want := []string{"ContainerStatus", "ImageExists", "PullImage", "CreateVolume", "RunContainer", "RemoveVolume"}
 	if len(docker.calls) != len(want) {
 		t.Fatalf("expected calls %v, got %v", want, docker.calls)
 	}
@@ -152,6 +153,27 @@ func TestExec_HappyPathCallsDockerInOrderAndCleansUp(t *testing.T) {
 		if docker.calls[i] != name {
 			t.Fatalf("expected call %d to be %s, got %s (calls=%v)", i, name, docker.calls[i], docker.calls)
 		}
+	}
+}
+
+func TestExec_SkipsPullWhenImageAlreadyPresent(t *testing.T) {
+	svc, _, docker, _ := newTestService()
+	sb := mustCreate(t, svc)
+	docker.imageExists = true
+
+	var buf bytes.Buffer
+	_, err := svc.Exec(context.Background(), sb.ID, "echo hi", noopOnStart, &buf)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+
+	for _, c := range docker.calls {
+		if c == "PullImage" {
+			t.Fatalf("expected PullImage to be skipped when image already exists, got %v", docker.calls)
+		}
+	}
+	if !slices.Contains(docker.calls, "ImageExists") {
+		t.Fatalf("expected ImageExists to be called, got %v", docker.calls)
 	}
 }
 
