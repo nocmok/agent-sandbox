@@ -1,8 +1,9 @@
 // Package sandbox implements the domain logic for managing agent sandboxes
 // on top of Kubernetes: sandbox metadata lives as instances of a Sandbox
-// custom resource (no separate database), and command execution runs in
-// ephemeral Jobs whose deterministic naming doubles as the per-sandbox
-// exec lock.
+// custom resource (no separate database), and each sandbox gets a
+// long-lived Pod, created alongside it and torn down with it, that exec
+// commands run against via the pods/exec subresource. See the Executor doc
+// comment for why, and for the exec-locking caveat.
 package sandbox
 
 import (

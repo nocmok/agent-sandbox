@@ -13,35 +13,32 @@ import (
 )
 
 type fakeExecutor struct {
-	createErr    error
-	streamErr    error
-	streamOutput string
-	executing    bool
-	executingErr error
+	createErr  error
+	execErr    error
+	execOutput string
+	deleteErr  error
 
 	createCalls int
+	execCalls   int
 	deleteCalls int
 }
 
-func (f *fakeExecutor) CreateJob(ctx context.Context, sandboxID, image, command string) error {
+func (f *fakeExecutor) CreatePod(ctx context.Context, sandboxID, image string) error {
 	f.createCalls++
 	return f.createErr
 }
 
-func (f *fakeExecutor) StreamLogs(ctx context.Context, sandboxID string, out io.Writer) error {
-	if f.streamOutput != "" {
-		_, _ = out.Write([]byte(f.streamOutput))
+func (f *fakeExecutor) Exec(ctx context.Context, sandboxID, command string, out io.Writer) error {
+	f.execCalls++
+	if f.execOutput != "" {
+		_, _ = out.Write([]byte(f.execOutput))
 	}
-	return f.streamErr
+	return f.execErr
 }
 
-func (f *fakeExecutor) IsExecuting(ctx context.Context, sandboxID string) (bool, error) {
-	return f.executing, f.executingErr
-}
-
-func (f *fakeExecutor) DeleteJob(ctx context.Context, sandboxID string) error {
+func (f *fakeExecutor) DeletePod(ctx context.Context, sandboxID string) error {
 	f.deleteCalls++
-	return nil
+	return f.deleteErr
 }
 
 func newTestService(exec *fakeExecutor) (*Service, *Store) {
@@ -99,15 +96,33 @@ func TestServiceDeleteNotFound(t *testing.T) {
 	}
 }
 
-func TestServiceDeleteRejectsWhileExecuting(t *testing.T) {
-	exec := &fakeExecutor{executing: true}
+func TestServiceDeleteRemovesPodThenRecord(t *testing.T) {
+	exec := &fakeExecutor{}
 	svc, _ := newTestService(exec)
 	ctx := context.Background()
 	if err := svc.Create(ctx, validID, "alpine"); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := svc.Delete(ctx, validID); !errors.Is(err, ErrExecuting) {
-		t.Fatalf("expected ErrExecuting, got %v", err)
+	if err := svc.Delete(ctx, validID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if exec.deleteCalls != 1 {
+		t.Fatalf("expected DeletePod to be called once, got %d", exec.deleteCalls)
+	}
+	if _, err := svc.Get(ctx, validID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected sandbox record to be gone, got %v", err)
+	}
+}
+
+func TestServiceCreateRollsBackRecordWhenPodFailsToStart(t *testing.T) {
+	exec := &fakeExecutor{createErr: errors.New("boom")}
+	svc, _ := newTestService(exec)
+	ctx := context.Background()
+	if err := svc.Create(ctx, validID, "alpine"); err == nil {
+		t.Fatalf("expected Create to fail when CreatePod fails")
+	}
+	if _, err := svc.Get(ctx, validID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected sandbox record to be rolled back, got %v", err)
 	}
 }
 
@@ -127,24 +142,65 @@ func TestServiceExecNotFound(t *testing.T) {
 	}
 }
 
-func TestServiceExecAlreadyExecuting(t *testing.T) {
-	exec := &fakeExecutor{createErr: ErrExecuting}
+func TestServiceExecRejectsConcurrentExec(t *testing.T) {
+	exec := &fakeExecutor{}
 	svc, _ := newTestService(exec)
 	ctx := context.Background()
 	if err := svc.Create(ctx, validID, "alpine"); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	_, err := svc.Exec(ctx, validID, "echo hi")
-	if !errors.Is(err, ErrExecuting) {
-		t.Fatalf("expected ErrExecuting, got %v", err)
+
+	start1, err := svc.Exec(ctx, validID, "sleep 1")
+	if err != nil {
+		t.Fatalf("first Exec: %v", err)
 	}
-	if exec.createCalls != 1 {
-		t.Fatalf("expected exactly one CreateJob call, got %d", exec.createCalls)
+	if _, err := svc.Exec(ctx, validID, "echo hi"); !errors.Is(err, ErrExecuting) {
+		t.Fatalf("expected ErrExecuting for concurrent exec, got %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := start1(&buf); err != nil {
+		t.Fatalf("start1: %v", err)
+	}
+
+	// The lock is released once the first exec's stream finishes, so a
+	// second exec should now be allowed.
+	start2, err := svc.Exec(ctx, validID, "echo hi")
+	if err != nil {
+		t.Fatalf("Exec after release: %v", err)
+	}
+	if err := start2(&buf); err != nil {
+		t.Fatalf("start2: %v", err)
 	}
 }
 
-func TestServiceExecStreamsOutputAndCleansUp(t *testing.T) {
-	exec := &fakeExecutor{streamOutput: "hello world"}
+func TestServiceDeleteRejectsWhileExecuting(t *testing.T) {
+	exec := &fakeExecutor{}
+	svc, _ := newTestService(exec)
+	ctx := context.Background()
+	if err := svc.Create(ctx, validID, "alpine"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	start, err := svc.Exec(ctx, validID, "sleep 1")
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if err := svc.Delete(ctx, validID); !errors.Is(err, ErrExecuting) {
+		t.Fatalf("expected ErrExecuting, got %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := start(&buf); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := svc.Delete(ctx, validID); err != nil {
+		t.Fatalf("Delete after exec finished: %v", err)
+	}
+}
+
+func TestServiceExecStreamsOutput(t *testing.T) {
+	exec := &fakeExecutor{execOutput: "hello world"}
 	svc, _ := newTestService(exec)
 	ctx := context.Background()
 	if err := svc.Create(ctx, validID, "alpine"); err != nil {
@@ -163,13 +219,10 @@ func TestServiceExecStreamsOutputAndCleansUp(t *testing.T) {
 	if buf.String() != "hello world" {
 		t.Fatalf("unexpected output: %q", buf.String())
 	}
-	if exec.deleteCalls != 1 {
-		t.Fatalf("expected DeleteJob to be called once after streaming, got %d", exec.deleteCalls)
-	}
 }
 
-func TestServiceExecCleansUpEvenOnStreamError(t *testing.T) {
-	exec := &fakeExecutor{streamErr: errors.New("boom")}
+func TestServiceExecSurfacesStreamError(t *testing.T) {
+	exec := &fakeExecutor{execErr: errors.New("boom")}
 	svc, _ := newTestService(exec)
 	ctx := context.Background()
 	if err := svc.Create(ctx, validID, "alpine"); err != nil {
@@ -184,8 +237,5 @@ func TestServiceExecCleansUpEvenOnStreamError(t *testing.T) {
 	var buf bytes.Buffer
 	if err := start(&buf); err == nil {
 		t.Fatalf("expected start to surface the stream error")
-	}
-	if exec.deleteCalls != 1 {
-		t.Fatalf("expected DeleteJob to be called even after a stream error, got %d", exec.deleteCalls)
 	}
 }

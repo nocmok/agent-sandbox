@@ -4,9 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/google/uuid"
 )
@@ -18,24 +17,56 @@ type Sandbox struct {
 	Image string
 }
 
-// jobRunner is the subset of Executor that Service depends on, declared
+// podRunner is the subset of Executor that Service depends on, declared
 // here so tests can substitute a fake without touching Kubernetes.
-type jobRunner interface {
-	CreateJob(ctx context.Context, sandboxID, image, command string) error
-	StreamLogs(ctx context.Context, sandboxID string, out io.Writer) error
-	IsExecuting(ctx context.Context, sandboxID string) (bool, error)
-	DeleteJob(ctx context.Context, sandboxID string) error
+type podRunner interface {
+	CreatePod(ctx context.Context, sandboxID, image string) error
+	Exec(ctx context.Context, sandboxID, command string, out io.Writer) error
+	DeletePod(ctx context.Context, sandboxID string) error
 }
 
 type Service struct {
 	store *Store
-	exec  jobRunner
+	exec  podRunner
+
+	// execLocks holds one mutex per sandbox, serializing Exec (and Delete)
+	// calls against that sandbox's Pod. It's in-process only: correct as
+	// long as sandboxd runs as a single instance. If sandboxd is ever
+	// scaled to multiple replicas, this needs to become a distributed
+	// lock (e.g. a coordination.k8s.io Lease per sandbox) instead.
+	locksMu   sync.Mutex
+	execLocks map[string]*sync.Mutex
 }
 
-func NewService(store *Store, exec jobRunner) *Service {
-	return &Service{store: store, exec: exec}
+func NewService(store *Store, exec podRunner) *Service {
+	return &Service{store: store, exec: exec, execLocks: make(map[string]*sync.Mutex)}
 }
 
+// execLock returns the mutex serializing calls against sandboxID's Pod,
+// creating it on first use.
+func (s *Service) execLock(id string) *sync.Mutex {
+	s.locksMu.Lock()
+	defer s.locksMu.Unlock()
+	l, ok := s.execLocks[id]
+	if !ok {
+		l = &sync.Mutex{}
+		s.execLocks[id] = l
+	}
+	return l
+}
+
+// forgetExecLock drops sandboxID's mutex once the sandbox is gone, so
+// execLocks doesn't grow without bound over the service's lifetime.
+func (s *Service) forgetExecLock(id string) {
+	s.locksMu.Lock()
+	defer s.locksMu.Unlock()
+	delete(s.execLocks, id)
+}
+
+// Create records the sandbox and starts its Pod, waiting for the Pod to be
+// running before returning. If the Pod fails to start, the sandbox record
+// is rolled back so the store — the source of truth for sandbox existence
+// — never points at a Pod that doesn't exist.
 func (s *Service) Create(ctx context.Context, id, image string) error {
 	if err := validateID(id); err != nil {
 		return err
@@ -43,7 +74,14 @@ func (s *Service) Create(ctx context.Context, id, image string) error {
 	if strings.TrimSpace(image) == "" {
 		return fmt.Errorf("%w: image is required", ErrValidation)
 	}
-	return s.store.Create(ctx, id, image)
+	if err := s.store.Create(ctx, id, image); err != nil {
+		return err
+	}
+	if err := s.exec.CreatePod(ctx, id, image); err != nil {
+		_ = s.store.Delete(ctx, id)
+		return err
+	}
+	return nil
 }
 
 func (s *Service) List(ctx context.Context, page, size int) ([]Sandbox, error) {
@@ -73,52 +111,56 @@ func (s *Service) Get(ctx context.Context, id string) (*Sandbox, error) {
 	return &sb, nil
 }
 
+// Delete removes the sandbox's Pod and then its record. It takes the same
+// per-sandbox lock Exec does, so a sandbox can't be deleted out from under
+// a command that's still running in it; if an exec is in flight, Delete
+// fails fast with ErrExecuting instead of blocking.
 func (s *Service) Delete(ctx context.Context, id string) error {
 	if _, err := s.store.Get(ctx, id); err != nil {
 		return err
 	}
-	executing, err := s.exec.IsExecuting(ctx, id)
-	if err != nil {
-		return err
-	}
-	if executing {
+
+	lock := s.execLock(id)
+	if !lock.TryLock() {
 		return ErrExecuting
 	}
-	return s.store.Delete(ctx, id)
+	defer lock.Unlock()
+
+	if err := s.exec.DeletePod(ctx, id); err != nil {
+		return err
+	}
+	if err := s.store.Delete(ctx, id); err != nil {
+		return err
+	}
+	s.forgetExecLock(id)
+	return nil
 }
 
-// Exec validates the sandbox and command, then acquires the exec lock (by
-// creating the Job) before returning. The returned start function performs
-// the actual wait/stream/cleanup; it is only ever invoked after HTTP
+// Exec validates the sandbox and command, then acquires the sandbox's exec
+// lock before returning — failing fast with ErrExecuting if another exec
+// is already in flight, rather than queuing behind it. The returned start
+// function runs the command in the sandbox's already-running Pod, streams
+// its output, and releases the lock; it is only ever invoked after HTTP
 // response headers have already committed to text/event-stream, so any
 // error it returns must be surfaced as stream content, not a status code.
 func (s *Service) Exec(ctx context.Context, id, command string) (start func(out io.Writer) error, err error) {
 	if strings.TrimSpace(command) == "" {
 		return nil, fmt.Errorf("%w: command is required", ErrValidation)
 	}
-	r, err := s.store.Get(ctx, id)
-	if err != nil {
+	if _, err := s.store.Get(ctx, id); err != nil {
 		return nil, err
 	}
-	if err := s.exec.CreateJob(ctx, id, r.Spec.Image, command); err != nil {
-		return nil, err
+
+	lock := s.execLock(id)
+	if !lock.TryLock() {
+		return nil, ErrExecuting
 	}
 
 	start = func(out io.Writer) error {
-		defer s.cleanupJob(id)
-		return s.exec.StreamLogs(ctx, id, out)
+		defer lock.Unlock()
+		return s.exec.Exec(ctx, id, command, out)
 	}
 	return start, nil
-}
-
-func (s *Service) cleanupJob(id string) {
-	// A fresh, un-canceled context: the request's context may already be
-	// done (client disconnected) by the time streaming ends.
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if err := s.exec.DeleteJob(ctx, id); err != nil {
-		log.Printf("cleanup exec job for sandbox %s: %v", id, err)
-	}
 }
 
 func validateID(id string) error {

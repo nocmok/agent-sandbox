@@ -1,6 +1,8 @@
 // Command sandboxd is the Agent Sandbox API server: it manages sandbox
-// metadata as Kubernetes custom resources and runs exec commands in
-// ephemeral Jobs. See docs/openapi.yml and docs/00-sandboxes-over-k8s.md.
+// metadata as Kubernetes custom resources and runs exec commands against a
+// per-sandbox Pod that lives for the sandbox's lifetime. See
+// docs/openapi.yml, docs/00-sandboxes-over-k8s.md, and the Executor doc
+// comment in internal/sandbox/executor.go.
 package main
 
 import (
@@ -35,7 +37,7 @@ func main() {
 	}
 
 	store := sandbox.NewStore(dynClient, namespace)
-	executor := sandbox.NewExecutor(clientset, namespace)
+	executor := sandbox.NewExecutor(clientset, cfg, namespace)
 	svc := sandbox.NewService(store, executor)
 
 	router := httpapi.NewRouter(svc)
