@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -96,18 +94,13 @@ func (s *Service) Exec(ctx context.Context, id uuid.UUID, command string, onStar
 	}
 
 	err = s.withLock(ctx, id, func(ctx context.Context) error {
-		t0 := time.Now()
 		sb, err := s.repo.GetSandbox(ctx, id)
 		if err != nil {
 			return err
 		}
-		log.Printf("[profile] %s GetSandbox took %s", id, time.Since(t0))
-
-		t1 := time.Now()
 		if err := s.ensureNotExecuting(ctx, id); err != nil {
 			return err
 		}
-		log.Printf("[profile] %s ensureNotExecuting took %s", id, time.Since(t1))
 
 		onStart()
 
@@ -124,7 +117,6 @@ func (s *Service) Exec(ctx context.Context, id uuid.UUID, command string, onStar
 		// exec). Only pull when the image isn't present locally already;
 		// this self-heals if it was later evicted, at the cost of not
 		// picking up a mutable tag's new digest until then.
-		t2 := time.Now()
 		exists, err := s.docker.ImageExists(ctx, sb.Image)
 		if err != nil {
 			return fmt.Errorf("checking image: %w", err)
@@ -134,28 +126,21 @@ func (s *Service) Exec(ctx context.Context, id uuid.UUID, command string, onStar
 				return fmt.Errorf("pulling image: %w", err)
 			}
 		}
-		log.Printf("[profile] %s image check/pull (existed=%v) took %s", id, exists, time.Since(t2))
 
-		t3 := time.Now()
 		if err := s.docker.CreateVolume(ctx, name, nfsDevicePath); err != nil {
 			return fmt.Errorf("creating volume: %w", err)
 		}
-		log.Printf("[profile] %s CreateVolume took %s", id, time.Since(t3))
 
-		t4 := time.Now()
 		code, runErr := s.docker.RunContainer(ctx, ContainerSpec{
 			Image:      sb.Image,
 			Name:       name,
 			VolumeName: name,
 			MountPath:  sb.Workspace,
 		}, command, out)
-		log.Printf("[profile] %s RunContainer (incl. command exec) took %s", id, time.Since(t4))
 
-		t5 := time.Now()
 		if rmErr := s.docker.RemoveVolume(ctx, name); rmErr != nil && runErr == nil {
 			runErr = fmt.Errorf("removing volume: %w", rmErr)
 		}
-		log.Printf("[profile] %s RemoveVolume took %s", id, time.Since(t5))
 		if runErr != nil {
 			return runErr
 		}
