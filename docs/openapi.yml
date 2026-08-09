@@ -1,0 +1,258 @@
+openapi: 3.0.3
+info:
+  title: Agent Sandbox API
+  version: "1.0"
+  description: >
+    Manages the lifecycle of isolated, ephemeral agent execution environments.
+paths:
+  /sandboxes:
+    post:
+      summary: Create a sandbox
+      description: >
+        Creates sandbox metadata and allocates its NFS-backed storage.
+        Does not start a container.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSandboxRequest'
+      responses:
+        '200':
+          description: Sandbox created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: 
+                  - id
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+        '400':
+          $ref: '#/components/responses/BadRequest'
+    get:
+      summary: List sandboxes
+      parameters:
+        - name: page
+          in: query
+          required: true
+          example: 0
+          schema:
+            type: integer
+        - name: size
+          in: query
+          required: true
+          example: 10
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: List of sandboxes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Sandbox'
+
+  /sandboxes/{id}:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    get:
+      summary: Provides sandbox details.
+      responses:
+        '200':
+          description: Sandbox details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sandbox'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      summary: Deletes a sandbox.
+      description: >
+        Deletes sandbox metadata and its NFS storage.
+      responses:
+        '204':
+          description: Sandbox deleted.
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: An exec is in progress for this sandbox (SANDBOX_EXECUTING).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /sandboxes/{id}/exec:
+    post:
+      summary: Execute a command in a sandbox
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecRequest'
+      responses:
+        '200':
+          description: Command output, streamed as Server-Sent Events from the container's stdout.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Another exec is already running for this sandbox (SANDBOX_EXECUTING).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /sandboxes/{id}/files:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+      - name: path
+        in: query
+        required: true
+        schema:
+          type: string
+        description: File path relative to the sandbox workspace.
+    get:
+      summary: Download a file from the sandbox workspace
+      responses:
+        '200':
+          description: File contents
+          content:
+            multipart/form-data:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Path refers to a directory or symlink
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: An exec is in progress for this sandbox (SANDBOX_EXECUTING).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Upload a file to the sandbox workspace
+      description: Overwrites the file if it already exists.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: File uploaded
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: An exec is in progress for this sandbox (SANDBOX_EXECUTING).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  parameters:
+    SandboxId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    CreateSandboxRequest:
+      type: object
+      required: 
+        - image
+        - workspace
+      properties:
+        image:
+          type: string
+          example: my-agentic-app-image
+        workspace:
+          type: string
+          example: /workspace
+
+    Sandbox:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        image:
+          type: string
+        workspace:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    ExecRequest:
+      type: object
+      required: 
+        - command
+      properties:
+        command:
+          type: string
+          example: "python agent.py --prompt '{\"tools\":[],\"messages\":[...]}'"
+
+    Error:
+      type: object
+      required: 
+        - error
+      properties:
+        error:
+          type: object
+          required: 
+            - code, 
+            - message
+          properties:
+            code:
+              type: string
+              example: SANDBOX_NOT_FOUND
+            message:
+              type: string
+
+  responses:
+    NotFound:
+      description: "Resource not found"
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    BadRequest:
+      description: "Malformed request"
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
