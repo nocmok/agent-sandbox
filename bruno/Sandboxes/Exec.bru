@@ -1,0 +1,17 @@
+meta {
+  name: Exec
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/sandboxes/{{sandboxId}}/exec
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "command": "echo 'payload that should be persisted' > /app/payload"
+  }
+}

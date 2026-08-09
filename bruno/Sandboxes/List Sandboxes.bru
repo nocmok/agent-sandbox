@@ -1,0 +1,16 @@
+meta {
+  name: List Sandboxes
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/sandboxes?page=0&size=20
+  body: none
+  auth: none
+}
+
+params:query {
+  page: 0
+  size: 20
+}

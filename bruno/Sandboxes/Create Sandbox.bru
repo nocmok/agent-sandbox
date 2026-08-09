@@ -1,0 +1,26 @@
+meta {
+  name: Create Sandbox
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/sandboxes
+  body: json
+  auth: none
+}
+
+headers {
+  Idempotency-Key: {{$randomUUID}}
+}
+
+body:json {
+  {
+    "image": "alpine:latest",
+    "workspace": "/app"
+  }
+}
+
+vars:post-response {
+  sandboxId: res.body.id
+}

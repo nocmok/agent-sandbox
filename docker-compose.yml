@@ -1,0 +1,55 @@
+volumes:
+  pg-data:
+  nfs-data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sandboxd
+      POSTGRES_USER: sandboxd
+      POSTGRES_PASSWORD: sandboxd
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sandboxd"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  nfs-server:
+    build: ./deploy/nfs-server
+    environment:
+      SHARED_DIRECTORY: /exports
+    ports:
+      - "2049:2049"
+    volumes:
+      - nfs-data:/exports
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    healthcheck:
+      test: ["CMD-SHELL", "showmount -e localhost || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  sandboxd:
+    build: .
+    environment:
+      DATABASE_URL: postgres://sandboxd:sandboxd@postgres:5432/sandboxd?sslmode=disable
+      NFS_EXPORT_HOST: localhost
+      LISTEN_ADDR: :8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nfs-server:
+        condition: service_healthy
