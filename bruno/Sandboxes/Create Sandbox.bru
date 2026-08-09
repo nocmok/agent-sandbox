@@ -10,17 +10,15 @@ post {
   auth: none
 }
 
-headers {
-  Idempotency-Key: {{$randomUUID}}
-}
-
 body:json {
   {
-    "image": "alpine:latest",
-    "workspace": "/app"
+    "id": "{{sandboxId}}",
+    "image": "alpine:latest"
   }
 }
 
-vars:post-response {
-  sandboxId: res.body.id
+script:pre-request {
+  const { v4: uuidv4 } = require('uuid');
+  
+  bru.setCollectionVar('sandboxId', uuidv4())
 }
