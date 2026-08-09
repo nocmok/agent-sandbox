@@ -120,6 +120,72 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /sandboxes/{id}/files/{path}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/parameters/SandboxId'
+      - name: path
+        in: path
+        required: true
+        description: >
+          Path inside the sandbox's container filesystem. May contain
+          slashes; matched as a wildcard tail segment.
+        schema:
+          type: string
+        example: workspace/data.csv
+    put:
+      summary: Upload a file into a sandbox
+      description: >
+        Writes the request body to path inside the sandbox's Pod, creating
+        parent directories as needed and overwriting any existing file.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '204':
+          description: File written.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: An exec is in progress for this sandbox (SANDBOX_EXECUTING).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      summary: Download a file from a sandbox
+      responses:
+        '200':
+          description: File contents.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: Sandbox not found (SANDBOX_NOT_FOUND) or file not found (FILE_NOT_FOUND).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: An exec is in progress for this sandbox (SANDBOX_EXECUTING).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
 components:
   parameters:
     SandboxId:

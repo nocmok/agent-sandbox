@@ -1,7 +1,9 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
+	clientgoexec "k8s.io/client-go/util/exec"
 )
 
 const (
@@ -112,9 +115,9 @@ func (e *Executor) waitForRunning(ctx context.Context, sandboxID string) error {
 	}
 }
 
-// Exec runs command inside the sandbox's already-running Pod and streams
-// its combined stdout/stderr to out.
-func (e *Executor) Exec(ctx context.Context, sandboxID, command string, out io.Writer) error {
+// podExecutor builds the SPDY executor for a pods/exec call against
+// sandboxID's Pod running command, with stdin wired in iff withStdin is set.
+func (e *Executor) podExecutor(sandboxID string, command []string, withStdin bool) (remotecommand.Executor, error) {
 	req := e.clientset.CoreV1().RESTClient().Post().
 		Resource("pods").
 		Namespace(e.namespace).
@@ -122,14 +125,25 @@ func (e *Executor) Exec(ctx context.Context, sandboxID, command string, out io.W
 		SubResource("exec").
 		VersionedParams(&corev1.PodExecOptions{
 			Container: sandboxContainerName,
-			Command:   []string{"/bin/sh", "-c", command},
+			Command:   command,
+			Stdin:     withStdin,
 			Stdout:    true,
 			Stderr:    true,
 		}, scheme.ParameterCodec)
 
 	executor, err := remotecommand.NewSPDYExecutor(e.restConfig, "POST", req.URL())
 	if err != nil {
-		return fmt.Errorf("build exec stream for sandbox %s: %w", sandboxID, err)
+		return nil, fmt.Errorf("build exec stream for sandbox %s: %w", sandboxID, err)
+	}
+	return executor, nil
+}
+
+// Exec runs command inside the sandbox's already-running Pod and streams
+// its combined stdout/stderr to out.
+func (e *Executor) Exec(ctx context.Context, sandboxID, command string, out io.Writer) error {
+	executor, err := e.podExecutor(sandboxID, []string{"/bin/sh", "-c", command}, false)
+	if err != nil {
+		return err
 	}
 
 	if err := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
@@ -139,6 +153,83 @@ func (e *Executor) Exec(ctx context.Context, sandboxID, command string, out io.W
 		return fmt.Errorf("exec in sandbox %s: %w", sandboxID, err)
 	}
 	return nil
+}
+
+// UploadFile writes r to path inside the sandbox's Pod, creating parent
+// directories as needed and overwriting any existing file. Unlike Exec,
+// stderr is kept separate from the transfer and only surfaced as part of
+// the returned error, since here stdin carries file bytes that must not be
+// interleaved with anything else.
+func (e *Executor) UploadFile(ctx context.Context, sandboxID, path string, r io.Reader) error {
+	executor, err := e.podExecutor(sandboxID, []string{"sh", "-c", `mkdir -p "$(dirname "$1")" && cat > "$1"`, "sh", path}, true)
+	if err != nil {
+		return err
+	}
+
+	var stderr bytes.Buffer
+	if err := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdin:  r,
+		Stdout: io.Discard,
+		Stderr: &stderr,
+	}); err != nil {
+		return fmt.Errorf("upload file to sandbox %s: %w", sandboxID, annotate(err, &stderr))
+	}
+	return nil
+}
+
+// DownloadFile streams path's contents from inside the sandbox's Pod to w.
+// Callers are expected to have confirmed the file exists (see StatFile)
+// before calling this, since once w starts receiving bytes there is no way
+// to turn a failure partway through into anything but a truncated stream.
+func (e *Executor) DownloadFile(ctx context.Context, sandboxID, path string, w io.Writer) error {
+	executor, err := e.podExecutor(sandboxID, []string{"cat", path}, false)
+	if err != nil {
+		return err
+	}
+
+	var stderr bytes.Buffer
+	if err := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: w,
+		Stderr: &stderr,
+	}); err != nil {
+		return fmt.Errorf("download file from sandbox %s: %w", sandboxID, annotate(err, &stderr))
+	}
+	return nil
+}
+
+// StatFile reports whether path exists as a regular file inside the
+// sandbox's Pod. It runs synchronously, with no streaming, so callers can
+// resolve existence before committing to an HTTP response status — the same
+// reason Service.Exec resolves lock/existence errors before its handler
+// commits headers to an SSE stream.
+func (e *Executor) StatFile(ctx context.Context, sandboxID, path string) (bool, error) {
+	executor, err := e.podExecutor(sandboxID, []string{"test", "-f", path}, false)
+	if err != nil {
+		return false, err
+	}
+
+	err = executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+	if err == nil {
+		return true, nil
+	}
+	var exitErr clientgoexec.CodeExitError
+	if errors.As(err, &exitErr) {
+		return false, nil
+	}
+	return false, fmt.Errorf("stat file in sandbox %s: %w", sandboxID, err)
+}
+
+// annotate appends any captured stderr output to err's message, so failures
+// from the shell snippets above (missing permissions, bad paths, ...) are
+// diagnosable instead of surfacing as a bare non-zero exit code.
+func annotate(err error, stderr *bytes.Buffer) error {
+	if stderr.Len() == 0 {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, bytes.TrimSpace(stderr.Bytes()))
 }
 
 // DeletePod removes the sandbox's Pod.

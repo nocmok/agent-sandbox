@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -18,9 +19,19 @@ type fakeExecutor struct {
 	execOutput string
 	deleteErr  error
 
-	createCalls int
-	execCalls   int
-	deleteCalls int
+	uploadErr      error
+	uploaded       []byte
+	statExists     bool
+	statErr        error
+	downloadErr    error
+	downloadOutput string
+
+	createCalls   int
+	execCalls     int
+	deleteCalls   int
+	uploadCalls   int
+	downloadCalls int
+	statCalls     int
 }
 
 func (f *fakeExecutor) CreatePod(ctx context.Context, sandboxID, image string) error {
@@ -39,6 +50,32 @@ func (f *fakeExecutor) Exec(ctx context.Context, sandboxID, command string, out 
 func (f *fakeExecutor) DeletePod(ctx context.Context, sandboxID string) error {
 	f.deleteCalls++
 	return f.deleteErr
+}
+
+func (f *fakeExecutor) UploadFile(ctx context.Context, sandboxID, path string, r io.Reader) error {
+	f.uploadCalls++
+	if f.uploadErr != nil {
+		return f.uploadErr
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	f.uploaded = data
+	return nil
+}
+
+func (f *fakeExecutor) DownloadFile(ctx context.Context, sandboxID, path string, w io.Writer) error {
+	f.downloadCalls++
+	if f.downloadOutput != "" {
+		_, _ = w.Write([]byte(f.downloadOutput))
+	}
+	return f.downloadErr
+}
+
+func (f *fakeExecutor) StatFile(ctx context.Context, sandboxID, path string) (bool, error) {
+	f.statCalls++
+	return f.statExists, f.statErr
 }
 
 func newTestService(exec *fakeExecutor) (*Service, *Store) {
@@ -237,5 +274,141 @@ func TestServiceExecSurfacesStreamError(t *testing.T) {
 	var buf bytes.Buffer
 	if err := start(&buf); err == nil {
 		t.Fatalf("expected start to surface the stream error")
+	}
+}
+
+func TestServiceUploadFileRejectsEmptyPath(t *testing.T) {
+	svc, _ := newTestService(&fakeExecutor{})
+	if err := svc.UploadFile(context.Background(), validID, "  ", bytes.NewReader(nil)); !errors.Is(err, ErrValidation) {
+		t.Fatalf("expected ErrValidation, got %v", err)
+	}
+}
+
+func TestServiceUploadFileNotFound(t *testing.T) {
+	svc, _ := newTestService(&fakeExecutor{})
+	if err := svc.UploadFile(context.Background(), validID, "a.txt", bytes.NewReader(nil)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestServiceUploadFileWritesContent(t *testing.T) {
+	exec := &fakeExecutor{}
+	svc, _ := newTestService(exec)
+	ctx := context.Background()
+	if err := svc.Create(ctx, validID, "alpine"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := svc.UploadFile(ctx, validID, "a.txt", strings.NewReader("hello")); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+	if string(exec.uploaded) != "hello" {
+		t.Fatalf("unexpected uploaded content: %q", exec.uploaded)
+	}
+}
+
+func TestServiceUploadFileRejectsWhileExecuting(t *testing.T) {
+	exec := &fakeExecutor{}
+	svc, _ := newTestService(exec)
+	ctx := context.Background()
+	if err := svc.Create(ctx, validID, "alpine"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	start, err := svc.Exec(ctx, validID, "sleep 1")
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if err := svc.UploadFile(ctx, validID, "a.txt", strings.NewReader("hello")); !errors.Is(err, ErrExecuting) {
+		t.Fatalf("expected ErrExecuting, got %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := start(&buf); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+}
+
+func TestServiceDownloadFileRejectsEmptyPath(t *testing.T) {
+	svc, _ := newTestService(&fakeExecutor{})
+	if _, err := svc.DownloadFile(context.Background(), validID, "  "); !errors.Is(err, ErrValidation) {
+		t.Fatalf("expected ErrValidation, got %v", err)
+	}
+}
+
+func TestServiceDownloadFileNotFound(t *testing.T) {
+	exec := &fakeExecutor{statExists: false}
+	svc, _ := newTestService(exec)
+	ctx := context.Background()
+	if err := svc.Create(ctx, validID, "alpine"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := svc.DownloadFile(ctx, validID, "missing.txt"); !errors.Is(err, ErrFileNotFound) {
+		t.Fatalf("expected ErrFileNotFound, got %v", err)
+	}
+	if exec.downloadCalls != 0 {
+		t.Fatalf("expected DownloadFile not to be called when stat says missing, got %d calls", exec.downloadCalls)
+	}
+}
+
+func TestServiceDownloadFileStreamsContent(t *testing.T) {
+	exec := &fakeExecutor{statExists: true, downloadOutput: "hello world"}
+	svc, _ := newTestService(exec)
+	ctx := context.Background()
+	if err := svc.Create(ctx, validID, "alpine"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	start, err := svc.DownloadFile(ctx, validID, "a.txt")
+	if err != nil {
+		t.Fatalf("DownloadFile: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := start(&buf); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if buf.String() != "hello world" {
+		t.Fatalf("unexpected content: %q", buf.String())
+	}
+}
+
+func TestServiceDownloadFileRejectsWhileExecuting(t *testing.T) {
+	exec := &fakeExecutor{statExists: true}
+	svc, _ := newTestService(exec)
+	ctx := context.Background()
+	if err := svc.Create(ctx, validID, "alpine"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	start, err := svc.Exec(ctx, validID, "sleep 1")
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if _, err := svc.DownloadFile(ctx, validID, "a.txt"); !errors.Is(err, ErrExecuting) {
+		t.Fatalf("expected ErrExecuting, got %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := start(&buf); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+}
+
+func TestServiceDownloadFileReleasesLockAfterStatFails(t *testing.T) {
+	exec := &fakeExecutor{statErr: errors.New("boom")}
+	svc, _ := newTestService(exec)
+	ctx := context.Background()
+	if err := svc.Create(ctx, validID, "alpine"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if _, err := svc.DownloadFile(ctx, validID, "a.txt"); err == nil {
+		t.Fatalf("expected DownloadFile to surface the stat error")
+	}
+
+	// The lock must have been released even though DownloadFile failed
+	// before returning a start function, or every later Exec/Delete would
+	// wrongly see ErrExecuting.
+	if _, err := svc.Exec(ctx, validID, "echo hi"); err != nil {
+		t.Fatalf("expected Exec to succeed after failed DownloadFile, got %v", err)
 	}
 }

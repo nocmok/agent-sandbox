@@ -1,0 +1,16 @@
+meta {
+  name: Upload File
+  type: http
+  seq: 5
+}
+
+put {
+  url: {{baseUrl}}/sandboxes/{{sandboxId}}/files/workspace/data.csv
+  body: text
+  auth: none
+}
+
+body:text {
+  a,b,c
+  1,2,3
+}

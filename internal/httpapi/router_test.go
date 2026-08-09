@@ -26,6 +26,12 @@ type fakeService struct {
 
 	execStart func(io.Writer) error
 	execErr   error
+
+	uploadErr error
+	uploaded  []byte
+
+	downloadStart func(io.Writer) error
+	downloadErr   error
 }
 
 func (f *fakeService) Create(ctx context.Context, id, image string) error {
@@ -46,6 +52,22 @@ func (f *fakeService) Delete(ctx context.Context, id string) error {
 
 func (f *fakeService) Exec(ctx context.Context, id, command string) (func(io.Writer) error, error) {
 	return f.execStart, f.execErr
+}
+
+func (f *fakeService) UploadFile(ctx context.Context, id, path string, r io.Reader) error {
+	if f.uploadErr != nil {
+		return f.uploadErr
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	f.uploaded = data
+	return nil
+}
+
+func (f *fakeService) DownloadFile(ctx context.Context, id, path string) (func(io.Writer) error, error) {
+	return f.downloadStart, f.downloadErr
 }
 
 func TestCreateSandbox(t *testing.T) {
@@ -227,6 +249,102 @@ func TestHealthz(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
+}
+
+func TestUploadFileSuccess(t *testing.T) {
+	svc := &fakeService{}
+	router := NewRouter(svc)
+	req := httptest.NewRequest(http.MethodPut, "/sandboxes/id/files/workspace/data.csv", strings.NewReader("a,b,c"))
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if string(svc.uploaded) != "a,b,c" {
+		t.Fatalf("unexpected uploaded content: %q", svc.uploaded)
+	}
+}
+
+func TestUploadFileNotFound(t *testing.T) {
+	router := NewRouter(&fakeService{uploadErr: sandbox.ErrNotFound})
+	req := httptest.NewRequest(http.MethodPut, "/sandboxes/id/files/a.txt", strings.NewReader("data"))
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+	assertErrorCode(t, rec.Body.Bytes(), "SANDBOX_NOT_FOUND")
+}
+
+func TestUploadFileConflict(t *testing.T) {
+	router := NewRouter(&fakeService{uploadErr: sandbox.ErrExecuting})
+	req := httptest.NewRequest(http.MethodPut, "/sandboxes/id/files/a.txt", strings.NewReader("data"))
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", rec.Code)
+	}
+	assertErrorCode(t, rec.Body.Bytes(), "SANDBOX_EXECUTING")
+}
+
+func TestDownloadFileSuccess(t *testing.T) {
+	start := func(w io.Writer) error {
+		_, _ = w.Write([]byte("hello world"))
+		return nil
+	}
+	router := NewRouter(&fakeService{downloadStart: start})
+	req := httptest.NewRequest(http.MethodGet, "/sandboxes/id/files/workspace/data.csv", nil)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
+		t.Fatalf("expected application/octet-stream, got %q", ct)
+	}
+	if cd := rec.Header().Get("Content-Disposition"); cd != `attachment; filename="data.csv"` {
+		t.Fatalf("unexpected Content-Disposition: %q", cd)
+	}
+	if rec.Body.String() != "hello world" {
+		t.Fatalf("unexpected body: %q", rec.Body.String())
+	}
+}
+
+func TestDownloadFileNotFound(t *testing.T) {
+	router := NewRouter(&fakeService{downloadErr: sandbox.ErrFileNotFound})
+	req := httptest.NewRequest(http.MethodGet, "/sandboxes/id/files/missing.txt", nil)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+	assertErrorCode(t, rec.Body.Bytes(), "FILE_NOT_FOUND")
+}
+
+func TestDownloadFileConflictBeforeStreaming(t *testing.T) {
+	router := NewRouter(&fakeService{downloadErr: sandbox.ErrExecuting})
+	req := httptest.NewRequest(http.MethodGet, "/sandboxes/id/files/a.txt", nil)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("expected json content-type on pre-stream error, got %q", ct)
+	}
+	assertErrorCode(t, rec.Body.Bytes(), "SANDBOX_EXECUTING")
 }
 
 func assertErrorCode(t *testing.T, body []byte, want string) {

@@ -23,6 +23,9 @@ type podRunner interface {
 	CreatePod(ctx context.Context, sandboxID, image string) error
 	Exec(ctx context.Context, sandboxID, command string, out io.Writer) error
 	DeletePod(ctx context.Context, sandboxID string) error
+	UploadFile(ctx context.Context, sandboxID, path string, r io.Reader) error
+	DownloadFile(ctx context.Context, sandboxID, path string, w io.Writer) error
+	StatFile(ctx context.Context, sandboxID, path string) (bool, error)
 }
 
 type Service struct {
@@ -159,6 +162,67 @@ func (s *Service) Exec(ctx context.Context, id, command string) (start func(out 
 	start = func(out io.Writer) error {
 		defer lock.Unlock()
 		return s.exec.Exec(ctx, id, command, out)
+	}
+	return start, nil
+}
+
+// UploadFile validates path and writes r's contents into the sandbox's Pod
+// at path, taking the sandbox's exec lock for the duration of the transfer
+// so it can't race with a running Exec or a concurrent Delete. Unlike Exec,
+// the whole transfer completes before UploadFile returns, so failures can
+// still be reported as a normal error rather than stream content.
+func (s *Service) UploadFile(ctx context.Context, id, path string, r io.Reader) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("%w: path is required", ErrValidation)
+	}
+	if _, err := s.store.Get(ctx, id); err != nil {
+		return err
+	}
+
+	lock := s.execLock(id)
+	if !lock.TryLock() {
+		return ErrExecuting
+	}
+	defer lock.Unlock()
+
+	return s.exec.UploadFile(ctx, id, path, r)
+}
+
+// DownloadFile validates the sandbox and command, confirms path exists,
+// then acquires the sandbox's exec lock before returning — mirroring Exec,
+// since streaming the file also runs against the Pod. The returned start
+// function streams path's contents to out and releases the lock; like
+// Exec's start, it must only be invoked after HTTP response headers have
+// already committed to a 200, since a failure partway through can only
+// surface as a truncated body, not a different status code. Existence is
+// checked up front specifically so a missing file can still come back as a
+// clean 404 instead of a truncated 200.
+func (s *Service) DownloadFile(ctx context.Context, id, path string) (start func(out io.Writer) error, err error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("%w: path is required", ErrValidation)
+	}
+	if _, err := s.store.Get(ctx, id); err != nil {
+		return nil, err
+	}
+
+	lock := s.execLock(id)
+	if !lock.TryLock() {
+		return nil, ErrExecuting
+	}
+
+	exists, err := s.exec.StatFile(ctx, id, path)
+	if err != nil {
+		lock.Unlock()
+		return nil, err
+	}
+	if !exists {
+		lock.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrFileNotFound, path)
+	}
+
+	start = func(out io.Writer) error {
+		defer lock.Unlock()
+		return s.exec.DownloadFile(ctx, id, path, out)
 	}
 	return start, nil
 }

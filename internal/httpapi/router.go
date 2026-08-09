@@ -22,6 +22,8 @@ type sandboxService interface {
 	Get(ctx context.Context, id string) (*sandbox.Sandbox, error)
 	Delete(ctx context.Context, id string) error
 	Exec(ctx context.Context, id, command string) (func(out io.Writer) error, error)
+	UploadFile(ctx context.Context, id, path string, r io.Reader) error
+	DownloadFile(ctx context.Context, id, path string) (func(out io.Writer) error, error)
 }
 
 type handlers struct {
@@ -37,6 +39,8 @@ func NewRouter(svc sandboxService) http.Handler {
 	mux.HandleFunc("GET /sandboxes/{id}", h.getSandbox)
 	mux.HandleFunc("DELETE /sandboxes/{id}", h.deleteSandbox)
 	mux.HandleFunc("POST /sandboxes/{id}/exec", h.execSandbox)
+	mux.HandleFunc("PUT /sandboxes/{id}/files/{path...}", h.uploadFile)
+	mux.HandleFunc("GET /sandboxes/{id}/files/{path...}", h.downloadFile)
 	mux.HandleFunc("GET /healthz", h.healthz)
 
 	return recoverMiddleware(loggingMiddleware(mux))

@@ -34,6 +34,8 @@ func mapError(err error) (int, string) {
 		return http.StatusNotFound, "SANDBOX_NOT_FOUND"
 	case errors.Is(err, sandbox.ErrExecuting):
 		return http.StatusConflict, "SANDBOX_EXECUTING"
+	case errors.Is(err, sandbox.ErrFileNotFound):
+		return http.StatusNotFound, "FILE_NOT_FOUND"
 	default:
 		return http.StatusInternalServerError, "INTERNAL_ERROR"
 	}
