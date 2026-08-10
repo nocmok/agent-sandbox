@@ -65,9 +65,10 @@ func (e *Executor) CreatePod(ctx context.Context, sandboxID, image string) error
 			RestartPolicy: corev1.RestartPolicyAlways,
 			Containers: []corev1.Container{
 				{
-					Name:    sandboxContainerName,
-					Image:   image,
-					Command: []string{"/bin/sh", "-c", "sleep infinity"},
+					Name:            sandboxContainerName,
+					Image:           image,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Command:         []string{"/bin/sh", "-c", "sleep infinity"},
 				},
 			},
 		},
