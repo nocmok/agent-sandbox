@@ -14,7 +14,7 @@ func (h *handlers) uploadFile(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	path := r.PathValue("path")
 
-	if err := h.svc.UploadFile(r.Context(), id, path, r.Body); err != nil {
+	if err := h.svc.UploadFile(r.Context(), id, fmt.Sprintf("/%s", path), r.Body); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -28,7 +28,7 @@ func (h *handlers) downloadFile(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	path := r.PathValue("path")
 
-	start, err := h.svc.DownloadFile(r.Context(), id, path)
+	start, err := h.svc.DownloadFile(r.Context(), id, fmt.Sprintf("/%s", path))
 	if err != nil {
 		writeError(w, err)
 		return
